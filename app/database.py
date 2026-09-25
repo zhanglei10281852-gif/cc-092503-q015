@@ -335,6 +335,159 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+
+CREATE TABLE IF NOT EXISTS retention_policy_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version INTEGER NOT NULL,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('global','sample_type','project')),
+    scope_value TEXT NOT NULL DEFAULT '',
+    retain_days INTEGER NOT NULL CHECK(retain_days >= 1),
+    legal_hold_days INTEGER NOT NULL DEFAULT 0 CHECK(legal_hold_days >= 0),
+    basis_text TEXT NOT NULL DEFAULT '',
+    change_reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+    superseded_by INTEGER REFERENCES retention_policy_versions(id),
+    superseded_at TEXT,
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_type, scope_value, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retention_policy_active_scope
+ON retention_policy_versions(scope_type, scope_value) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS legal_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_code TEXT NOT NULL UNIQUE,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('sample','project','sample_type')),
+    sample_id INTEGER REFERENCES samples(id),
+    scope_value TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    hold_days INTEGER,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','released')),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    starts_at TEXT NOT NULL,
+    expires_at TEXT,
+    released_at TEXT,
+    released_by INTEGER REFERENCES users(id),
+    release_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_legal_holds_state ON legal_holds(state);
+CREATE INDEX IF NOT EXISTS idx_legal_holds_sample ON legal_holds(sample_id);
+
+CREATE TABLE IF NOT EXISTS publication_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    publication_code TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    review_state TEXT NOT NULL CHECK(review_state IN ('under_review','published','withdrawn')),
+    expected_clear_at TEXT,
+    registered_by INTEGER NOT NULL REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(sample_id, publication_code)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_sample ON publication_reviews(sample_id, review_state);
+
+CREATE TABLE IF NOT EXISTS retention_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    reason TEXT NOT NULL,
+    extra_days INTEGER NOT NULL CHECK(extra_days > 0 AND extra_days <= 3650),
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approved','rejected','cancelled','expired')),
+    required_approvals INTEGER NOT NULL DEFAULT 2 CHECK(required_approvals >= 2),
+    expires_at TEXT NOT NULL,
+    decided_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_extensions_sample ON retention_extensions(sample_id, state);
+
+CREATE TABLE IF NOT EXISTS retention_extension_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension_id INTEGER NOT NULL REFERENCES retention_extensions(id) ON DELETE CASCADE,
+    approver_user_id INTEGER NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    comment TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    UNIQUE(extension_id, approver_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS retention_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_date TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    policy_fingerprint TEXT NOT NULL DEFAULT '',
+    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    total_samples INTEGER NOT NULL DEFAULT 0,
+    processed_samples INTEGER NOT NULL DEFAULT 0,
+    included_count INTEGER NOT NULL DEFAULT 0,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
+    deferred_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    started_by TEXT NOT NULL DEFAULT 'system',
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retention_conclusions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id INTEGER NOT NULL REFERENCES retention_evaluations(id),
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    outcome TEXT NOT NULL CHECK(outcome IN ('included','excluded','deferred')),
+    reason_code TEXT NOT NULL,
+    reason_detail TEXT NOT NULL DEFAULT '',
+    policy_version_id INTEGER REFERENCES retention_policy_versions(id),
+    base_retention_date TEXT,
+    eligible_at TEXT,
+    deferred_until TEXT,
+    applied_extension_ids_json TEXT NOT NULL DEFAULT '[]',
+    blocking_hold_ids_json TEXT NOT NULL DEFAULT '[]',
+    blocking_loan_ids_json TEXT NOT NULL DEFAULT '[]',
+    blocking_anomaly_ids_json TEXT NOT NULL DEFAULT '[]',
+    blocking_review_ids_json TEXT NOT NULL DEFAULT '[]',
+    stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0,1)),
+    stale_reason TEXT NOT NULL DEFAULT '',
+    superseded_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(evaluation_id, sample_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conclusions_sample ON retention_conclusions(sample_id, id);
+CREATE INDEX IF NOT EXISTS idx_conclusions_outcome ON retention_conclusions(evaluation_id, outcome);
+
+CREATE TABLE IF NOT EXISTS destruction_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_code TEXT NOT NULL UNIQUE,
+    source_evaluation_id INTEGER NOT NULL REFERENCES retention_evaluations(id),
+    state TEXT NOT NULL DEFAULT 'planned' CHECK(state IN ('planned','released','executed','cancelled')),
+    sample_count INTEGER NOT NULL CHECK(sample_count > 0),
+    planned_by INTEGER NOT NULL REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    manifest_digest TEXT NOT NULL,
+    released_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS destruction_batch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES destruction_batches(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    conclusion_id INTEGER NOT NULL REFERENCES retention_conclusions(id),
+    sample_code TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    unit TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    UNIQUE(batch_id, sample_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_items_sample ON destruction_batch_items(sample_id);
 """
 
 PERMISSIONS = [
@@ -353,6 +506,14 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
     ("anomalies.manage", "管理异常", "anomalies", "manage"),
+    ("retention.policy.write", "维护保存策略", "retention_policy", "write"),
+    ("retention.evaluate", "执行到期评估", "retention_evaluation", "run"),
+    ("retention.extension.request", "申请保留延期", "retention_extension", "request"),
+    ("retention.extension.approve", "审批保留延期", "retention_extension", "approve"),
+    ("retention.hold.manage", "管理法律保留", "legal_hold", "manage"),
+    ("retention.review.register", "登记论文复核引用", "publication_review", "register"),
+    ("retention.report.read", "查看到期候选报告", "retention_report", "read"),
+    ("destruction.plan", "编制成组销毁计划", "destruction_plan", "write"),
 ]
 
 
@@ -432,10 +593,15 @@ def init_db() -> None:
             "sample_manager": [
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
                 "loans.manage", "inventory.manage", "anomalies.manage",
+                "retention.evaluate", "retention.hold.manage", "retention.review.register",
+                "retention.report.read", "destruction.plan",
             ],
-            "researcher": ["samples.read", "samples.consume"],
-            "approver": ["samples.read", "approvals.decide"],
-            "auditor": ["samples.read", "audit.read"],
+            "researcher": [
+                "samples.read", "samples.consume",
+                "retention.extension.request", "retention.review.register", "retention.report.read",
+            ],
+            "approver": ["samples.read", "approvals.decide", "retention.extension.approve", "retention.report.read"],
+            "auditor": ["samples.read", "audit.read", "retention.report.read"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
@@ -445,6 +611,17 @@ def init_db() -> None:
                 f"SELECT ?,id,? FROM permissions WHERE code IN ({placeholders})",
                 (role_id, now, *permission_codes),
             )
+        connection.execute(
+            """INSERT INTO retention_policy_versions(
+                   version,scope_type,scope_value,retain_days,legal_hold_days,basis_text,
+                   change_reason,status,created_by,created_at
+               )
+               SELECT 1,'global','',365,0,'机构样品管理默认规定','系统初始默认保存策略','active',NULL,?
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM retention_policy_versions WHERE scope_type='global' AND scope_value=''
+               )""",
+            (now,),
+        )
 
 
 def migrate_db() -> None:
