@@ -244,6 +244,8 @@ class ApprovalService:
             principal.require("samples.destroy")
         elif data["action_type"] == "inventory_adjustment":
             principal.require("inventory.manage")
+        elif data["action_type"] == "retention_extension":
+            principal.require("retention.extend")
         else:
             principal.require("samples.write")
         now_dt = self.clock.now()
@@ -258,6 +260,12 @@ class ApprovalService:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
+        if before["action_type"] == "retention_extension" and result["state"] in {"approved", "rejected"}:
+            from app.retention.service import sync_extension_on_decision
+
+            sync_extension_on_decision(
+                self.connection, before["action_type"], request_id, result["state"], to_storage(self.clock.now())
+            )
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
         return result
 

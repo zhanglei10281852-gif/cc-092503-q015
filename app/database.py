@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS consumption_records (
 CREATE TABLE IF NOT EXISTS approval_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_code TEXT NOT NULL UNIQUE,
-    action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment')),
+    action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment','retention_extension')),
     resource_type TEXT NOT NULL,
     resource_id INTEGER NOT NULL,
     requested_by INTEGER NOT NULL REFERENCES users(id),
@@ -335,6 +335,157 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+
+CREATE TABLE IF NOT EXISTS retention_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_code TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version >= 1),
+    sample_type TEXT NOT NULL,
+    project_code TEXT,
+    retention_months INTEGER NOT NULL CHECK(retention_months > 0),
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('active','superseded')),
+    supersedes_id INTEGER REFERENCES retention_policies(id),
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(policy_code, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retention_policies_active_code
+    ON retention_policies(policy_code) WHERE status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retention_policies_active_match
+    ON retention_policies(sample_type, IFNULL(project_code,'')) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS retention_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_key TEXT NOT NULL UNIQUE,
+    run_date TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    checkpoint_sample_id INTEGER NOT NULL DEFAULT 0,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    deferred_count INTEGER NOT NULL DEFAULT 0,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
+    unchanged_count INTEGER NOT NULL DEFAULT 0,
+    policy_digest TEXT NOT NULL,
+    locked_by TEXT,
+    locked_at TEXT,
+    error_message TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retention_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    run_id INTEGER NOT NULL REFERENCES retention_runs(id),
+    policy_id INTEGER REFERENCES retention_policies(id),
+    policy_version INTEGER,
+    decision TEXT NOT NULL CHECK(decision IN ('candidate','deferred','excluded')),
+    retain_until TEXT,
+    reasons_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('current','superseded')),
+    superseded_by INTEGER REFERENCES retention_evaluations(id),
+    superseded_reason TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retention_eval_current
+    ON retention_evaluations(sample_id) WHERE status='current';
+CREATE INDEX IF NOT EXISTS idx_retention_eval_sample ON retention_evaluations(sample_id, id);
+CREATE INDEX IF NOT EXISTS idx_retention_eval_policy ON retention_evaluations(policy_id, status);
+
+CREATE TABLE IF NOT EXISTS legal_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER REFERENCES samples(id),
+    project_code TEXT,
+    reason TEXT NOT NULL,
+    placed_by INTEGER NOT NULL REFERENCES users(id),
+    placed_at TEXT NOT NULL,
+    released_by INTEGER REFERENCES users(id),
+    released_at TEXT,
+    release_note TEXT,
+    CHECK (sample_id IS NOT NULL OR project_code IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_legal_holds_active
+    ON legal_holds(sample_id, project_code) WHERE released_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS paper_review_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    publication TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK(state IN ('active','released')),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    released_by INTEGER REFERENCES users(id),
+    released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_refs_active
+    ON paper_review_refs(sample_id) WHERE state='active';
+
+CREATE TABLE IF NOT EXISTS retention_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension_code TEXT NOT NULL UNIQUE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    request_id INTEGER NOT NULL UNIQUE REFERENCES approval_requests(id),
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    extend_until TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','cancelled')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_retention_extensions_sample ON retention_extensions(sample_id, state);
+
+CREATE TABLE IF NOT EXISTS retention_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_code TEXT NOT NULL UNIQUE,
+    run_id INTEGER REFERENCES retention_runs(id),
+    generated_by INTEGER REFERENCES users(id),
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    deferred_count INTEGER NOT NULL DEFAULT 0,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retention_report_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES retention_reports(id) ON DELETE CASCADE,
+    evaluation_id INTEGER NOT NULL REFERENCES retention_evaluations(id),
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    decision TEXT NOT NULL CHECK(decision IN ('candidate','deferred','excluded')),
+    retain_until TEXT,
+    reasons_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, evaluation_id)
+);
+
+CREATE TABLE IF NOT EXISTS destruction_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_code TEXT NOT NULL UNIQUE,
+    report_id INTEGER NOT NULL REFERENCES retention_reports(id),
+    state TEXT NOT NULL CHECK(state IN ('draft','submitted','completed','cancelled')),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS destruction_plan_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id INTEGER NOT NULL REFERENCES destruction_plans(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    evaluation_id INTEGER NOT NULL REFERENCES retention_evaluations(id),
+    approval_request_id INTEGER REFERENCES approval_requests(id),
+    destruction_record_id INTEGER REFERENCES destruction_records(id),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approval_requested','executed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(plan_id, sample_id)
+);
 """
 
 PERMISSIONS = [
@@ -353,6 +504,9 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
     ("anomalies.manage", "管理异常", "anomalies", "manage"),
+    ("retention.read", "查看保存期评估与报告", "retention", "read"),
+    ("retention.manage", "维护保存策略与销毁计划", "retention", "manage"),
+    ("retention.extend", "申请样品保留延期", "retention", "extend"),
 ]
 
 
@@ -401,9 +555,49 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_approval_requests(connection: sqlite3.Connection) -> None:
+    """为已有数据库的 approval_requests 表补充 retention_extension 审批类型。
+
+    SQLite 无法修改 CHECK 约束，需要在关闭外键的前提下重建表；
+    approval_decisions 的外键按表名引用，重建后自动指回新表。
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_requests'"
+    ).fetchone()
+    if row is None or "retention_extension" in row[0]:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE approval_requests_migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_code TEXT NOT NULL UNIQUE,
+                action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment','retention_extension')),
+                resource_type TEXT NOT NULL,
+                resource_id INTEGER NOT NULL,
+                requested_by INTEGER NOT NULL REFERENCES users(id),
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','cancelled','expired','executed')),
+                required_approvals INTEGER NOT NULL DEFAULT 2 CHECK(required_approvals >= 2),
+                expires_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO approval_requests_migrated SELECT * FROM approval_requests;
+            DROP TABLE approval_requests;
+            ALTER TABLE approval_requests_migrated RENAME TO approval_requests;
+            """
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
+    _migrate_approval_requests(connection)
     connection.executescript(SCHEMA)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
@@ -432,10 +626,11 @@ def init_db() -> None:
             "sample_manager": [
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
                 "loans.manage", "inventory.manage", "anomalies.manage",
+                "retention.read", "retention.manage",
             ],
-            "researcher": ["samples.read", "samples.consume"],
-            "approver": ["samples.read", "approvals.decide"],
-            "auditor": ["samples.read", "audit.read"],
+            "researcher": ["samples.read", "samples.consume", "retention.read", "retention.extend"],
+            "approver": ["samples.read", "approvals.decide", "retention.read"],
+            "auditor": ["samples.read", "audit.read", "retention.read"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

@@ -67,7 +67,7 @@ class LoanReturn(BaseModel):
 
 class ApprovalCreate(BaseModel):
     request_code: str | None = Field(default=None, max_length=64)
-    action_type: Literal["loan", "destruction", "location_reveal", "inventory_adjustment"]
+    action_type: Literal["loan", "destruction", "location_reveal", "inventory_adjustment", "retention_extension"]
     resource_type: str = Field(min_length=2, max_length=50)
     resource_id: int = Field(gt=0)
     payload: dict[str, Any] = Field(default_factory=dict)
